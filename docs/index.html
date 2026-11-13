@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Almanac notes</title>
+<style>
+  :root { --cream:#F5EEE1; --panel:#FBF6EC; --ink:#463427; --soft:#6B5444; --line:#E2D3BC; --accent:#B97B4D; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--cream); color:var(--ink); font-family: Georgia, "Iowan Old Style", serif; }
+  main { max-width: 520px; margin: 0 auto; padding: 28px 20px 60px; }
+  h1 { font-weight: normal; font-size: 28px; margin: 0 0 4px; }
+  p.sub { color: var(--soft); margin: 0 0 22px; line-height: 1.45; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 16px; margin: 12px 0; }
+  label { display:block; font-size: 14px; color: var(--soft); margin: 10px 0 4px; }
+  textarea, input { width: 100%; font: inherit; font-size: 17px; padding: 12px; border: 1px solid #D9C7AC; border-radius: 10px; background: #fff; color: var(--ink); }
+  textarea { min-height: 96px; resize: vertical; }
+  .row { display:flex; gap:10px; }
+  .row > div { flex:1; }
+  button { font: inherit; font-size: 16px; padding: 12px 16px; border-radius: 10px; border: 0; background: var(--accent); color: #fff; }
+  button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+  button.small { padding: 6px 10px; font-size: 14px; }
+  .note { display:flex; justify-content:space-between; gap:12px; align-items:flex-start; }
+  .note .when { color: var(--soft); font-size: 14px; margin-top: 4px; }
+  .status { color: var(--soft); font-size: 14px; min-height: 20px; margin-top: 8px; }
+  .warn { color: #9A4A2E; }
+  details summary { cursor: pointer; color: var(--soft); }
+  .count { float:right; font-size: 13px; color: var(--soft); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Almanac notes</h1>
+  <p class="sub">Write a short note and choose when it should appear. Notes are encrypted on this phone before they're saved, so only the Almanac can read them.</p>
+
+  <div class="card" id="setup">
+    <details id="setupBox">
+      <summary>Setup (once per phone)</summary>
+      <label>Mailbox key (64 hex characters)</label>
+      <input id="key" autocomplete="off" autocapitalize="none" spellcheck="false">
+      <label>GitHub token (fine-grained, "Contents: read and write" on sj-almanac-firmware only)</label>
+      <input id="token" type="password" autocomplete="off">
+      <div style="margin-top:12px"><button id="saveSetup">Save on this phone</button></div>
+      <div class="status" id="setupStatus"></div>
+    </details>
+  </div>
+
+  <div class="card">
+    <label for="text">Note <span class="count" id="count">0 / 140</span></label>
+    <textarea id="text" maxlength="140" placeholder="Good morning, love. Snow is coming."></textarea>
+    <div class="row">
+      <div><label>Show from</label><input id="from" type="datetime-local"></div>
+      <div><label>Until (optional)</label><input id="to" type="datetime-local"></div>
+    </div>
+    <div style="margin-top:14px"><button id="add">Save note</button></div>
+    <div class="status" id="status"></div>
+  </div>
+
+  <h2 style="font-weight:normal;font-size:20px;margin:26px 0 6px">Scheduled notes</h2>
+  <div id="list"><p class="sub">Loading…</p></div>
+</main>
+
+<script>
+const OWNER = "jacksonmlukas", REPO = "sj-almanac-firmware", PATH = "mailbox.json";
+const $ = (id) => document.getElementById(id);
+const store = { get k() { return localStorage.getItem("sj_key") || ""; }, get t() { return localStorage.getItem("sj_token") || ""; } };
+
+// The Almanac's font covers basic Latin plus a few typographic marks.
+const MAP = { "“": '"', "”": '"', "‘": "'", " ": " ", "–": "-", "…": "…", "’": "’", "—": "—", "°": "°", "·": "·" };
+function clean(s) {
+  let out = "", dropped = false;
+  for (const ch of s.normalize("NFKD")) {
+    const c = ch.codePointAt(0);
+    if (MAP[ch] !== undefined) { out += MAP[ch]; continue; }
+    if (c >= 0x300 && c <= 0x36F) continue;                 // strip accents (é -> e)
+    if (c === 10 || (c >= 0x20 && c <= 0x7E)) { out += ch; continue; }
+    dropped = true;
+  }
+  return { text: out.replace(/\n{2,}/g, "\n").trim(), dropped };
+}
+
+const hex2buf = (h) => new Uint8Array(h.match(/.{2}/g).map((b) => parseInt(b, 16)));
+const b64 = (u8) => btoa(String.fromCharCode(...u8));
+const unb64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+async function cryptoKey() {
+  const k = store.k.trim().toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(k)) throw new Error("Add the mailbox key in Setup first.");
+  return crypto.subtle.importKey("raw", hex2buf(k), "AES-GCM", false, ["encrypt", "decrypt"]);
+}
+async function seal(obj) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, await cryptoKey(), new TextEncoder().encode(JSON.stringify(obj))));
+  return { iv: b64(iv), ct: b64(ct) };
+}
+async function open_(n) {
+  const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv: unb64(n.iv) }, await cryptoKey(), unb64(n.ct));
+  return JSON.parse(new TextDecoder().decode(pt));
+}
+
+async function gh(method, body) {
+  const r = await fetch(`https://api.github.com/repos/${OWNER}/${REPO}/contents/${PATH}`, {
+    method, headers: { Authorization: `Bearer ${store.t}`, Accept: "application/vnd.github+json" },
+    body: body ? JSON.stringify(body) : undefined, cache: "no-store" });
+  if (!r.ok) throw new Error(`GitHub said ${r.status}. Check the token in Setup.`);
+  return r.json();
+}
+async function load() {
+  if (store.t) {
+    const f = await gh("GET");
+    return { sha: f.sha, box: JSON.parse(decodeURIComponent(escape(atob(f.content.replace(/\n/g, ""))))) };
+  }
+  const r = await fetch(`https://raw.githubusercontent.com/${OWNER}/${REPO}/main/${PATH}?t=${Date.now()}`);
+  return { sha: null, box: await r.json() };
+}
+async function save(box, sha, msg) {
+  const content = btoa(unescape(encodeURIComponent(JSON.stringify(box, null, 1) + "\n")));
+  await gh("PUT", { message: msg, content, sha });
+}
+
+function fmt(s) {
+  if (!s) return "";
+  const d = new Date(s);
+  return d.toLocaleString(undefined, { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+}
+
+async function render() {
+  const list = $("list");
+  try {
+    const { box } = await load();
+    if (!box.notes.length) { list.innerHTML = '<p class="sub">No notes yet.</p>'; return; }
+    const items = [];
+    for (let i = 0; i < box.notes.length; i++) {
+      let n; try { n = await open_(box.notes[i]); } catch { n = { text: "(locked — add the key in Setup)", from: "" }; }
+      items.push({ i, n });
+    }
+    items.sort((a, b) => (a.n.from || "").localeCompare(b.n.from || ""));
+    list.innerHTML = "";
+    for (const { i, n } of items) {
+      const el = document.createElement("div"); el.className = "card note";
+      el.innerHTML = `<div><div class="t"></div><div class="when"></div></div><button class="ghost small">Remove</button>`;
+      el.querySelector(".t").textContent = n.text;
+      el.querySelector(".when").textContent = n.from ? `${fmt(n.from)}${n.to ? " → " + fmt(n.to) : " (that day)"}` : "";
+      el.querySelector("button").onclick = () => remove(i);
+      list.appendChild(el);
+    }
+  } catch (e) { list.innerHTML = `<p class="sub warn">${e.message}</p>`; }
+}
+
+async function add() {
+  const st = $("status");
+  try {
+    const c = clean($("text").value);
+    if (!c.text) throw new Error("Write a note first.");
+    if (!$("from").value) throw new Error("Choose when it should appear.");
+    if (!store.t) throw new Error("Add the GitHub token in Setup first.");
+    st.textContent = "Encrypting and saving…";
+    const { box, sha } = await load();
+    box.notes.push(await seal({ text: c.text, from: $("from").value, to: $("to").value || "" }));
+    await save(box, sha, "Add note");
+    $("text").value = ""; $("count").textContent = "0 / 140";
+    st.textContent = c.dropped ? "Saved. (Emoji and unusual characters were removed — the Almanac can't display them.)" : "Saved. The Almanac will pick it up within about 20 minutes.";
+    render();
+  } catch (e) { st.innerHTML = `<span class="warn">${e.message}</span>`; }
+}
+
+async function remove(i) {
+  if (!confirm("Remove this note?")) return;
+  try { const { box, sha } = await load(); box.notes.splice(i, 1); await save(box, sha, "Remove note"); render(); }
+  catch (e) { $("status").innerHTML = `<span class="warn">${e.message}</span>`; }
+}
+
+$("text").addEventListener("input", () => { $("count").textContent = `${$("text").value.length} / 140`; });
+$("add").onclick = add;
+$("saveSetup").onclick = () => {
+  localStorage.setItem("sj_key", $("key").value.trim()); localStorage.setItem("sj_token", $("token").value.trim());
+  $("setupStatus").textContent = "Saved on this phone."; render();
+};
+const now = new Date(); now.setMinutes(now.getMinutes() - now.getTimezoneOffset());
+$("from").value = now.toISOString().slice(0, 16);
+$("key").value = store.k; $("token").value = store.t;
+if (!store.k || !store.t) $("setupBox").open = true;
+render();
+</script>
+</body>
+</html>
